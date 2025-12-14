@@ -1,0 +1,220 @@
+const functions = require('@google-cloud/functions-framework');
+const axios = require('axios');
+const fs = require('fs');
+const jwt = require('jsonwebtoken');
+
+//salesforce connected App info
+
+const CLIENT_ID ='3MVG9CecKwYCDceTZzsJhEtVrt8VQ9u36CL86vyHi9b4qqKIJpP1dX6Z_1cFrGZeyKS7V_gi16ZW8ddQIvjGq';
+const USERNAME = 'bharatgettingbetter@cpq.com';
+const LOGIN_URL = 'https://login.salesforce.com';
+
+const privateKey = fs.readFileSync('server.key','utf8');
+
+async function getSalesforceToken(){
+  const token = jwt.sign({
+    iss: CLIENT_ID,
+    sub: USERNAME,
+    aud: LOGIN_URL,
+    exp: Math.floor(Date.now() / 1000)+300
+  },
+  privateKey,
+  { algorithm:'RS256'} 
+  );
+  
+  const authResp = await axios.post(`${LOGIN_URL}/services/oauth2/token`,null,{
+    params:{
+      grant_type:'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion : token
+    },
+    validateStatus: () => true
+  });
+
+  console.log('Salesforce Auth Response Status:', authResp.status);
+  console.log('Salesforce Auth Response Data:', authResp.data);
+
+  if(authResp.status !== 200) {
+    throw new Error(`Auth failed: ${JSON.stringify(authResp.data)}`);
+  }
+
+  return {
+    accessToken: authResp.data.access_token,
+    instanceUrl: authResp.data.instance_url 
+  };
+}
+
+//======Helper:Call Salesforce CPQ (or other Apex/REST methods) ======
+
+async function callSalesforceAPI(instanceUrl,accessToken,urlPath,method ,data){
+  const resp = await axios({
+    url : `${instanceUrl}${urlPath}`,
+    method,
+    headers:{Authorization : `Bearer ${accessToken}`},
+    data
+  });
+  return resp.data;
+}
+
+
+functions.http('helloHttp',async(req,res)=>{
+
+
+//quote 1 line 10 = read produ ,add pro, save =< quote 2 => quote 2 
+
+  try{
+    const sourcequoteId = req.query.sourcequoteId || req.body.sourcequoteId;
+    const newquoteId = req.query.newquoteId || req.body.newquoteId;
+    if(!sourcequoteId) {
+      return res.status(400).send({error : 'Missing source quoteId'});
+    }
+     if(!newquoteId) {
+      return res.status(400).send({error : 'Missing new quoteId'});
+    }
+
+    // generate Salesforce access token 
+    const{accessToken,instanceUrl} = await getSalesforceToken();
+    
+    console.log('instanceUrl =>'+instanceUrl);
+
+      
+    //read source quote 
+    var sourcequote = await callSalesforceAPI(
+      instanceUrl,
+      accessToken,
+      `/services/apexrest/SBQQ/ServiceRouter?reader=SBQQ.QuoteAPI.QuoteReader&uid=${sourcequoteId}`,
+      'GET',
+      null
+    );
+    
+    var newquote = await callSalesforceAPI(
+      instanceUrl,
+      accessToken,
+      `/services/apexrest/SBQQ/ServiceRouter?reader=SBQQ.QuoteAPI.QuoteReader&uid=${newquoteId}`,
+      'GET',
+      null
+    );
+    const sourcequoteObj = JSON.parse(sourcequote);
+    const newquoteObj = JSON.parse(newquote);
+   //const newquoteObjId = newquoteObj.record.id;
+
+    console.log('sourcequote record =>'+sourcequoteObj.record.Id);
+    console.log('sourcequote lineitems =>'+sourcequoteObj.lineItems);
+    const pricebookId = sourcequoteObj.record.pricebookId;
+    const currency = sourcequoteObj.record.currency;
+
+    let productList = []; 
+    for(const lines of sourcequoteObj.lineItems){
+       
+        console.log('quoteLine quote=>'+lines.record.SBQQ__Product__c);
+        productList.push(lines.record.SBQQ__Product__c);
+    }
+    console.log('productList=>'+productList.length);
+    console.log('productList=>'+productList);
+    for(const index in productList){
+        console.log('prodId=>'+productList[index]);
+    }
+
+    const contextObj = { pricebookId : pricebookId , currencyCode : currency};
+    const contextbody = {context : JSON.stringify(contextObj)};
+
+    console.log('contextbody'+JSON.stringify(contextbody));
+
+    let productModelList = [];
+    for(const index in productList){
+       var prod = await callSalesforceAPI(
+        instanceUrl,
+        accessToken,
+        `/services/apexrest/SBQQ/ServiceRouter?loader=SBQQ.ProductAPI.ProductLoader&uid=${productList[index]}`,
+        'PATCH',
+        {"context" : "{\"pricebookId\": \"01s2t000001Z7AAAA0\", \"currencyCode\":\"INR\"}"}
+        ); 
+        const productModel = JSON.parse(prod);
+        productModelList.push(productModel);
+    }
+
+     console.log('productModelList=>'+productModelList.length);
+    // add the product to new quote
+    //create payload of add 
+    const quoteData = {
+        record: {
+            attributes: {
+                type: "SBQQ__Quote__c",
+                url: "/services/data/v63.0/sobjects/SBQQ__Quote__c/"+newquoteId
+            },
+            Name: ""+newquoteObj.record.Name,
+            Id: ""+newquoteId
+        },
+        nextKey: 2,
+        netTotal: 0.00,
+        lineItems: [],
+        lineItemGroups: [],
+        customerTotal: 0.00
+    };
+    const contextData = {
+        quote: quoteData,
+        products: productModelList,
+        groupKey: 0,
+        ignoreCalculate: true
+    };
+    const quoteadderpayload = {
+        context: JSON.stringify(contextData)
+    };
+    console.log('quoteData =>'+JSON.stringify(quoteadderpayload)); 
+    
+    
+    // call to add
+    var addProdtoQuote = await callSalesforceAPI(
+        instanceUrl,
+        accessToken,
+        `/services/apexrest/SBQQ/ServiceRouter?loader=SBQQ.QuoteAPI.QuoteProductAdder`,
+        'PATCH',
+        quoteadderpayload
+        ); 
+        
+    console.log('Product Added Successfully'+addProdtoQuote);
+    // Saving the quote 
+
+    const modeldata = {
+        record :{ 
+            attributes : {
+                type : "SBQQ__Quote__c",
+                url: "/services/data/v63.0/sobjects/SBQQ__Quote__c/"+newquoteId
+            },
+            Name: ""+newquoteObj.record.Name,
+            Id: ""+newquoteId
+        },
+        nextKey:2,
+        netTotal : 0.00,
+        lineItems:[],
+        lineItemGroups:[],
+        customerTotal:0.00
+    };
+    const quoteSaverPayload = {
+        saver : "SBQQ.QuoteAPI.QuoteSaver",
+        model : JSON.stringify(modeldata)
+    };
+
+    console.log('quoteSaverPayload'+JSON.stringify(quoteSaverPayload));
+
+    var saveQuote = await callSalesforceAPI(
+        instanceUrl,
+        accessToken,
+        `/services/apexrest/SBQQ/ServiceRouter`,
+        'POST',
+        quoteSaverPayload
+        ); 
+        
+    console.log('Quote Saved Successfully'+saveQuote);
+
+
+    //read new quote 
+    res.status(200).json({
+      sourcequote,
+      newquote
+    });
+  }
+  catch(err){
+    console.error(err);
+    res.status(500).send({ error: err.message });
+  }
+})

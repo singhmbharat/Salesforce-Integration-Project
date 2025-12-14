@@ -1,0 +1,347 @@
+//Yashshree Akolkar
+//Class Purpose : used to get Po Details from wwt via EDI and need to validate details 
+//
+
+@RestResource(urlMapping='/Arista/v1/PostPODetails')
+global class WWT_APIPostPODetails {
+    
+    
+    public static String ERROR_CODE_INVALID_QUOTE = '1001';
+    public static String ERROR_CODE_EXPIRED_QUOTE = '1002';
+    public static String ERROR_CODE_LOCKED_QUOTE = '1003';
+    public static String ERROR_CODE_SYSTEM_ERROR = '1004';
+    public static String ERROR_CODE_PO_VALIDATION_FAILED = '1005';
+    public static String ERROR_CODE_JSON_ERROR = '1006';
+    public static String ERROR_MSG_INVALID_QUOTE = 'Invalid Quote Number';
+    public static String ERROR_MSG_EXPIRED_QUOTE = 'Quote Already Expired';
+    public static String ERROR_MSG_LOCKED_QUOTE = 'Quote Locked';
+    public static String ERROR_MSG_SYSTEM_ERROR = 'System Error! Please try after sometime';
+    public static String QUOTE_MSG_PO_VALIDATED = 'PO Validated';
+    public static String ERROR_MSG_PO_VALIDATION_FAILED = 'PO Validation Failed';
+    
+    
+    @HttpPost
+    global static ResponseWrapper poDetails(){
+        RestRequest request = RestContext.request;
+        ResponseWrapper resWrap = new ResponseWrapper(); 
+        WWT_POWrapper poRequestWrapper;
+        Quote_PO__c quotePO;
+
+        try{
+
+            String transacId = 'PostPODetails';
+            API_Logger__c apiLogRec = ANET_MasterUtility.generateAPILog(transacId,RestContext.request.httpMethod,RestContext.request.resourcePath,RestContext.request.requestURI,RestContext.request.remoteAddress,RestContext.request.requestBody,RestContext.request.params);
+
+            String requestJson = request.requestBody.toString();
+
+            poRequestWrapper = (WWT_POWrapper) System.JSON.deserialize(requestJson,WWT_POWrapper.class);
+
+            resWrap = processPODetails(poRequestWrapper);
+
+        }
+        catch(Exception e){
+
+            resWrap = errorResp('ERROR_CODE_JSON_ERROR', 'No matching quote found.',false);    
+            //resWrap.success = false;
+            //resWrap.error_message = 'JSON ERROR';
+            //resWrap.error_code = ERROR_CODE_JSON_ERROR;
+        }
+
+        return resWrap;
+    }
+
+
+    public static ResponseWrapper processPODetails(WWT_POWrapper poRequestWrapper) {
+
+        List<String> resellerIds = Org_Settings__mdt.getInstance('WWT_Reseller_AccountID').value__c.split(',');
+        
+        List<SBQQ__Quote__c> quotes = [[select id,SBQQ__ExpirationDate__c,EDI_Transaction__c,End_Customer_PO__c,Need_By_Date__c,Grand_Total__c,SBQQ__Opportunity2__c,SBQQ__Opportunity2__r.Quotenumber__c,SBQQ__Opportunity2__r.PO_Number__c,CurrencyIsoCode,QuoteNumber__c,SBQQ__Ordered__c,Special_Quoting__c,SBQQ__Account__c,SBQQ__Account__r.Name,Quote_Name__c,Quote_Stage__c,Arista_Address__c,Template_Bill_To_Name__c,Template_Ship_To_Name__c,Price_Adjustment_Qty__c,(select id,PO_Line_Number__c,Price_Adjustment_Association__c,Template_Net_Total__c,SBQQ__SubscriptionTerm__c,SBQQ__Number__c,Name,SBQQ__Hidden__c,Template_Product_Code__c,SBQQ__Quantity__c,Product_Type__c,SBQQ__Product__r.Series_Name__c,SBQQ__Product__r.Is_MOJO_Product__c from SBQQ__LineItems__r) from SBQQ__Quote__c where Assign_Reseller__r.NetSuiteID__c IN:resellerAccountId and Master_Price_List__c = false and Name=:poRequestWrapper.quoteNumber]; 
+
+
+
+        if (quotes.isEmpty()) {
+            return errorResp('INVALID_QUOTE', 'No matching quote found.',false);
+        }
+
+        SBQQ__Quote__c quote = quotes[0];
+        Quote_PO__c quotePO = createQuotePO(quote, requestJson, poWrapper.poNumber);
+
+        if (quote.SBQQ__ExpirationDate__c != null && quote.SBQQ__ExpirationDate__c < Date.today()) {
+            updateQuotePO(quotePO, '', 'Expired Quote', 'PO Validation Failed');
+            return errorResp('EXPIRED_QUOTE', 'Quote is expired.',false);
+        }
+
+        if (quote.Quote_Stage__c != 'Finalized') {
+            updateQuotePO(quotePO, '', 'Locked Quote', 'PO Validation Failed');
+            return errorResp('LOCKED_QUOTE', 'Quote is not finalized.',false);
+        }
+
+        ValidationWrapper poValidation = validatePODetails(poRequestWrapper,quote);
+
+        if (!validation.isMatch) {
+            updateQuotePO(quotePO, poValidation.misMatchReason, '', ERROR_MSG_PO_VALIDATION_FAILED);
+            return errorResp('ERROR_CODE_PO_VALIDATION_FAILED', ERROR_MSG_PO_VALIDATION_FAILED,false);
+        }
+
+        Savepoint sp = Database.setSavepoint();
+        try {
+            Opportunity opp = createOrUpdateOpp(quote, poWrapper.poNumber);
+            updateQuoteLines(quote.SBQQ__LineItems__r, poWrapper);
+            updateQuote(quote, opp, poWrapper);
+            updateQuotePO(quotePO, '', '', 'PO Validated');
+            res.success = true;
+            return res;
+        } catch (Exception e) {
+            Database.rollback(sp);
+            ANET_MasterUtility.logApexException(e, 'WWT_PODetailsService', 'processPODetails', 'Quote', e.getMessage());
+            updateQuotePO(quotePO, '', e.getMessage(), 'PO Validation Failed');
+            return ResponseUtil.error('SYSTEM_ERROR', 'An unexpected error occurred.');
+        }
+    }
+
+
+    public static ResponseWrapper errorResp(String code, String message, Boolean issuccess) {
+        ResponseWrapper r = new ResponseWrapper();
+        r.success = issuccess;
+        r.error_code = code;
+        r.error_message = message;
+        return r;
+    }
+    
+    //Method : validatePODetails
+    //Use Case :  used to validate the po details corresponding to quote
+    public static ValidationWrapper validatePODetails(WWT_POWrapper poRequestWrapper,SBQQ__Quote__c quote){
+        
+        ValidationWrapper vwrapper = new ValidationWrapper();
+        
+        List<WWT_POWrapper.lineItem> lineitems = poRequestWrapper.lineItems;
+        Map<Integer,SBQQ__QuoteLine__c> quoteLineItemMap = new Map<Integer,SBQQ__QuoteLine__c>();
+        Map<Decimal,Decimal> poLineMap = new Map<Decimal,Decimal>();
+        List<SBQQ__QuoteLine__c> quoteLineList = quote.SBQQ__LineItems__r;
+        List<SBQQ__QuoteLine__c> quotepoLine =  new List<SBQQ__QuoteLine__c>();
+        Boolean isMatch = true;
+        String misMatchReason ='';
+        //Header Checks 
+        if (poRequestWrapper.aristaSubsidiary != quote.Arista_Address__c){
+            isMatch = false;
+            misMatchReason += 'Subsidiary not matching,';
+        }
+        if (poRequestWrapper.quoteNumber != quote.QuoteNumber__c){
+            isMatch = false;
+            misMatchReason += 'Quote Name not matching,';
+        }
+        
+        if (poRequestWrapper.grandTotal != quote.Grand_Total__c) {
+            isMatch = false;
+            misMatchReason += 'Grand Total not matching,';
+        }
+        if(!isMatch){
+            vwrapper.isMatch= false;
+            vwrapper.misMatchReason =misMatchReason;
+            return vwrapper;
+        }
+        
+        
+        //line level check
+        for(SBQQ__QuoteLine__c ql : quoteLineList){
+            
+            if(!ql.SBQQ__Hidden__c && !ql.Product_Type__c.equals('Base Model')){
+                quotepoLine.add(ql);
+            }
+            if(ql.Template_Product_Code__c.equals('PRI-Price Adjustment')){
+                poLineMap.put(ql.Price_Adjustment_Association__c,ql.SBQQ__Quantity__c);
+            }
+            quoteLineItemMap.put(Integer.valueOf(ql.SBQQ__Number__c),ql);	
+        }
+        
+        
+        if(lineitems.size() != quotepoLine.size()-quote.Price_Adjustment_Qty__c){
+            vwrapper.isMatch = false;
+            vwrapper.misMatchReason += 'Total lines count mismatch,';
+            return vwrapper;
+        } 
+        System.debug('quote Line Map =>'+quoteLineItemMap);
+        //check sequence matching based on line number of quote , pdf and order  
+        //price adj logic 
+        
+        for(WWT_POWrapper.lineItem item : lineitems){
+            misMatchReason = '';
+            if(quoteLineItemMap.get(item.quoteLineNumber)!=NULL){
+                
+                SBQQ__QuoteLine__c qline = quoteLineItemMap.get(item.quoteLineNumber); 
+                
+                misMatchReason += qline.Template_Product_Code__c+'-';
+                if(item.quantity != qline.SBQQ__Quantity__c){
+                    isMatch = false;
+                    misMatchReason += 'Quoteline Quantity mismatch,';
+                } 
+                if(item.product!=qline.Template_Product_Code__c){
+                    isMatch = false;
+                    misMatchReason += 'Product code mismatch,';
+                }
+                if(item.term!=qline.SBQQ__SubscriptionTerm__c){
+                    isMatch = false;
+                    misMatchReason += 'Quoteline Term mismatch,';
+                }
+                Decimal priceAdjQty = poLineMap.get(item.quoteLineNumber);
+                
+                Decimal netTotalPrice = qline.Template_Net_Total__c;
+                if(priceAdjQty!=NULL){
+                    netTotalPrice = qline.Template_Net_Total__c - priceAdjQty;
+                }
+                System.debug('Net Total Price=>'+netTotalPrice);
+                if(item.netTotalPrice!=netTotalPrice){
+                    isMatch = false;
+                    misMatchReason += 'Quoteline total price mismatch,';
+                }
+            }
+            else{
+                isMatch = false;
+                misMatchReason += 'Product/line not found in quote,';
+            }
+            if(!isMatch){
+                vwrapper.isMatch= false;
+                vwrapper.misMatchReason =misMatchReason;
+                break;
+            }            
+        }
+        
+        return vwrapper;
+    }
+    
+    //Method : createQuotePO
+    //Use Case :  used to create a quote po details record
+    public static Quote_PO__c createQuotePO(SBQQ__Quote__c quote,String requestJson,String poNumber){
+        Quote_PO__c quotePO = new Quote_PO__c();
+        
+        try{
+            quotePO.PO_Request__c = requestJson;
+            quotePO.name = poNumber;
+            quotePO.Quote__c = quote.id;
+            quotePO.Quote_Status__c = 'Received PO'; 
+            Insert quotePO;
+        }
+        catch(Exception ex){
+            ANET_MasterUtility.logApexException(ex, 'WWT_APIPostPODetails','updateQuotePO','SBQQ__Quote__c',ex.getMessage());
+        }
+        return quotePO; 
+    }
+    
+    //Method : updateQuotePO
+    //Use Case :  used to update the quote po details 
+    public static void updateQuotePO(Quote_PO__c quotePo,String poMismatchReason,String errorMsg,String status){
+        try{
+            if(quotePo!=NULL){
+                quotePo.Quote_Status__c = status;
+                if(!String.isBlank(poMismatchReason)){
+                    quotePo.PO_Mismatch_Reason__c = poMismatchReason;
+                }
+                if(!String.isBlank(errorMsg)){
+                    quotePo.Error_Message__c  = errorMsg;
+                }
+                update quotePO; 
+            }
+        }
+        catch(Exception ex){
+            ANET_MasterUtility.logApexException(ex, 'WWT_APIPostPODetails','updateQuotePO','SBQQ__Quote__c',ex.getMessage());
+        }   
+    }
+    //Method : updateQuote
+    //Use Case :  this method is used to update the quote from PO
+    public static void updateQuote(SBQQ__Quote__c quote,Opportunity opp,WWT_POWrapper poRequestWrapper){
+        
+        String QUOTESTAGE = 'Received PO';
+        
+        try{
+            if(opp!=NULL && quote.SBQQ__Opportunity2__c==NULL){
+                quote.SBQQ__Opportunity2__c = opp.id;
+            }
+            quote.SBQQ__Primary__c = true;
+            quote.Quote_Stage__c = QUOTESTAGE;
+            quote.EDI_Transaction__c = true;
+            quote.End_Customer_PO__c = poRequestWrapper.endCustomerPO;
+            for(WWT_POWrapper.lineItem item : poRequestWrapper.lineItems){
+                if(!String.isBlank(item.needByDate)){
+                    quote.Need_By_Date__c = Date.valueOf(item.needByDate);  
+                    break;
+                }
+            }
+            update quote;  
+        }catch(Exception ex){
+            ANET_MasterUtility.logApexException(ex, 'WWT_APIPostPODetails','updateQuote','SBQQ__Quote__c',ex.getMessage());  
+        }
+        
+    }
+    //Method : updateQuoteLines
+    //Use Case :  this method is used to update the quote lines values from PO
+    public static void updateQuoteLines(List<SBQQ__QuoteLine__c> quoteLineList,WWT_POWrapper poRequestWrapper){
+        
+        Map<Integer,WWT_POWrapper.lineItem> poLineItemMap = new Map<Integer,WWT_POWrapper.lineItem>();
+        List<SBQQ__QuoteLine__c> updateqlList = new List<SBQQ__QuoteLine__c>();
+        
+        try{
+            if(quoteLineList!=NULL && quoteLineList.size()>0){
+                
+                for(WWT_POWrapper.lineItem item : poRequestWrapper.lineItems){
+                    poLineItemMap.put(item.quoteLineNumber,item);
+                }
+                
+                for(SBQQ__QuoteLine__c ql : quoteLineList){
+                    ql.PO_Line_Number__c = 0;
+                    if(poLineItemMap.get(Integer.valueOf(ql.SBQQ__Number__c))!=NULL){
+                        WWT_POWrapper.lineItem item = poLineItemMap.get(Integer.valueOf(ql.SBQQ__Number__c));
+                        ql.PO_Line_Number__c = item.poLineNumber;
+                    }                    
+                    updateqlList.add(ql);  
+                }
+            }
+            if(updateqlList.size()>0){
+                SBQQ.TriggerControl.disable();
+                update updateqlList;
+                SBQQ.TriggerControl.enable(); 
+            }
+        }
+        catch(Exception ex){
+            ANET_MasterUtility.logApexException(ex, 'WWT_APIPostPODetails','updateQuoteLines','SBQQ__Quote__c',ex.getMessage());  
+        }
+    }
+    //Method : updateQuoteLines
+    //Use Case :  this method is used to create or update the opportunity if it does not exists
+    public static Opportunity createOrUpdateOpp(SBQQ__Quote__c quote,String poNumber){
+        
+        Opportunity opp;
+        
+        try{
+            Boolean createOpp = quote.SBQQ__Opportunity2__c!=NULL?false:true;
+            if(createOpp){
+                List<SBQQ__QuoteLine__c> quoteLineList = quote.SBQQ__LineItems__r;
+                opp = SNIGenerateOrderController.createOpportunity(quote,poNumber,quoteLineList);
+                insert opp;
+            }else{
+                opp = quote.SBQQ__Opportunity2__r;
+                opp.PO_Number__c = poNumber;
+                opp.Quotenumber__c = quote.QuoteNumber__c;
+                update opp;
+            }
+        }
+        catch(Exception ex){
+            ANET_MasterUtility.logApexException(ex, 'WWT_APIPostPODetails','createOrUpdateOpp','SBQQ__Quote__c',ex.getMessage());  
+        }
+        return opp; 
+    }
+    
+    
+    global class ResponseWrapper{
+        public String error_message;
+        public Boolean success;
+        public String error_code;
+    }
+    global class ValidationWrapper {
+        Boolean isMatch;
+        String misMatchReason;
+        ValidationWrapper(){
+            isMatch = true;
+            misMatchReason = '';
+        }
+    }
+}
